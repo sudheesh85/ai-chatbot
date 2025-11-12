@@ -38,6 +38,8 @@ export default function ChatContainer() {
   }, [messages]);
 
   const handleSendMessage = async (content: string) => {
+    const defaultOrgId = Number(process.env.NEXT_PUBLIC_DEFAULT_ORG_ID);
+
     // Add user message
     const userMessage: MessageType = {
       id: `user-${Date.now()}`,
@@ -61,10 +63,18 @@ export default function ChatContainer() {
     setMessages((prev) => [...prev, assistantMessage]);
 
     try {
-      const request = {
+      const request: {
+        question: string;
+        session_id: string;
+        org_id?: number;
+      } = {
         question: content,
         session_id: sessionId,
       };
+
+      if (!Number.isNaN(defaultOrgId)) {
+        request.org_id = defaultOrgId;
+      }
 
       // Check if streaming is enabled (you can make this configurable)
       const useStreaming = process.env.NEXT_PUBLIC_USE_STREAMING !== 'false';

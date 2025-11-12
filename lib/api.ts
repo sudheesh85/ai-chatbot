@@ -55,12 +55,12 @@ class APIClient {
   ) {
     const token = this.client.defaults.headers.common['Authorization']?.toString().replace('Bearer ', '');
     const apiKey = this.client.defaults.headers.common['X-API-Key']?.toString();
-    
-    const url = new URL(this.streamingURL);
+
     const headers: HeadersInit = {
       'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
     };
-    
+
     if (token) {
       headers['Authorization'] = `Bearer ${token}`;
     } else if (apiKey) {
@@ -75,48 +75,136 @@ class APIClient {
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        const message = await response.text();
+        throw new Error(message || `HTTP error! status: ${response.status}`);
       }
 
       const reader = response.body?.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
+      const decoder = new TextDecoder('utf-8');
 
       if (!reader) {
         throw new Error('No response body');
       }
 
-      while (true) {
-        const { done, value } = await reader.read();
-        
-        if (done) break;
+      let buffer = '';
+      let accumulatedText = '';
+      let completed = false;
+      let metaColumns: string[] | undefined;
+      let metaRows: any[][] | undefined;
+      let metaVisualization: APIResponse['visualization'];
+      let metaSuccess = false;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') {
+          if (done) {
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const rawLine of lines) {
+            const line = rawLine.trim();
+            if (!line.startsWith('data:')) {
               continue;
             }
+
+            const payload = line.slice(5).trim();
+            if (!payload) {
+              continue;
+            }
+
+            let event: any;
             try {
-              const parsed = JSON.parse(data);
-              if (parsed.chunk) {
-                onChunk(parsed.chunk);
+              event = JSON.parse(payload);
+            } catch {
+              continue;
+            }
+
+            const eventType = event.type as string | undefined;
+
+            switch (eventType) {
+              case 'status':
+                // Ignore backend status updates for end users
+                break;
+              case 'metadata':
+                metaColumns = event.columns ?? metaColumns;
+                metaRows = event.rows ?? metaRows;
+                metaVisualization = event.visualization ?? metaVisualization;
+                metaSuccess = event.success ?? metaSuccess;
+                break;
+              case 'chunk': {
+                const chunkText: string =
+                  (typeof event.accumulated === 'string' && event.accumulated) ||
+                  (typeof event.text === 'string' ? event.text : '');
+                if (chunkText) {
+                  accumulatedText = chunkText;
+                  onChunk(accumulatedText);
+                }
+                break;
               }
-              if (parsed.complete) {
-                onComplete(parsed);
+              case 'complete': {
+                const finalText: string =
+                  (typeof event.text === 'string' && event.text) || accumulatedText;
+                accumulatedText = finalText;
+                onComplete({
+                  success: metaSuccess || true,
+                  response: finalText,
+                  data:
+                    metaColumns && metaRows
+                      ? {
+                          columns: metaColumns,
+                          rows: metaRows,
+                        }
+                      : undefined,
+                  visualization: metaVisualization,
+                });
+                completed = true;
+                break;
               }
-            } catch (e) {
-              // Skip invalid JSON
+              case 'error': {
+                completed = true;
+                throw new Error(
+                  event.message ||
+                    'The assistant could not find relevant information for this question.'
+                );
+              }
+              default:
+                break;
+            }
+
+            if (completed) {
+              break;
             }
           }
+
+          if (completed) {
+            break;
+          }
         }
+      } finally {
+        reader.releaseLock();
+      }
+
+      if (!completed) {
+        onComplete({
+          success: metaSuccess || Boolean(accumulatedText),
+          response: accumulatedText,
+          data:
+            metaColumns && metaRows
+              ? {
+                  columns: metaColumns,
+                  rows: metaRows,
+                }
+              : undefined,
+          visualization: metaVisualization,
+        });
       }
     } catch (error: any) {
-      onError(new Error(error.message || 'Streaming request failed'));
+      onError(new Error(error?.message || 'Streaming request failed'));
     }
   }
 
